@@ -4,7 +4,7 @@ services:
   mongodb:
     image: mongo:7.0
     container_name: underwater_navigation_mongodb
-    restart: always
+    restart: unless-stopped
     ports:
       - "27017:27017"
     environment:
@@ -23,11 +23,33 @@ services:
       timeout: 10s
       retries: 3
 
+  api-server:
+    build: .
+    container_name: underwater_navigation_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MONGODB_URL: mongodb://admin:underwater_nav_2025@mongodb:27017/
+      DATABASE_NAME: underwater_navigation
+      HOST: 0.0.0.0
+      PORT: 8000
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - underwater_nav_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   # Optional: MongoDB Express for database management
   mongo-express:
     image: mongo-express:1.0.0
     container_name: underwater_navigation_mongo_express
-    restart: always
+    restart: unless-stopped
     ports:
       - "8081:8081"
     environment:
@@ -36,7 +58,8 @@ services:
       ME_CONFIG_MONGODB_URL: mongodb://admin:underwater_nav_2025@mongodb:27017/
       ME_CONFIG_BASICAUTH: false
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
     networks:
       - underwater_nav_network
 

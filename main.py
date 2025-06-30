@@ -1,22 +1,30 @@
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
-from datetime import datetime
-import json
-import uvicorn
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
+
 from database import db_config, COLLECTIONS
-from contextlib import asynccontextmanager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    print("🔄 Connecting to MongoDB...")
+    logger.info("Starting up - connecting to MongoDB...")
     await db_config.connect_to_mongo()
     yield
     # Shutdown
-    print("🔄 Closing MongoDB connection...")
+    logger.info("Shutting down - closing MongoDB connection...")
     await db_config.close_mongo_connection()
 
 app = FastAPI(
@@ -26,24 +34,24 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Data models for different types of sensor data
+# Data models
 class DHTSensorData(BaseModel):
     sensor_id: str
     temperature: float
     humidity: float
     timestamp: Optional[datetime] = None
-    location: Optional[Dict[str, float]] = None  # {"lat": x, "lon": y, "depth": z}
+    location: Optional[Dict[str, float]] = None
 
 class NavigationData(BaseModel):
     device_id: str
-    position: Dict[str, float]  # {"x": x, "y": y, "z": z}
-    orientation: Dict[str, float]  # {"roll": x, "pitch": y, "yaw": z}
+    position: Dict[str, float]
+    orientation: Dict[str, float]
     velocity: Optional[Dict[str, float]] = None
     timestamp: Optional[datetime] = None
 
 class MappingData(BaseModel):
     sensor_id: str
-    scan_data: List[Dict[str, Any]]  # Sonar/LiDAR data points
+    scan_data: List[Dict[str, Any]]
     timestamp: Optional[datetime] = None
     position: Optional[Dict[str, float]] = None
 
@@ -54,304 +62,139 @@ class GeneralSensorData(BaseModel):
     timestamp: Optional[datetime] = None
     metadata: Optional[Dict[str, Any]] = None
 
-# Root endpoint
+# Helper function to save data
+async def save_to_database(collection_name: str, data: dict) -> dict:
+    """Save data to MongoDB collection"""
+    try:
+        collection = db_config.get_collection(collection_name)
+        if collection is None:
+            return {"status": "partial_success", "message": "Database not available"}
+        
+        result = await collection.insert_one(data)
+        logger.info(f"Data saved to {collection_name} with ID: {result.inserted_id}")
+        return {
+            "status": "success", 
+            "message": "Data saved successfully",
+            "database_id": str(result.inserted_id)
+        }
+    except Exception as e:
+        logger.error(f"Database error in {collection_name}: {str(e)}")
+        return {"status": "error", "message": "Database error occurred"}
+
 @app.get("/")
 async def root():
     return {
         "message": "Underwater Navigation Data Collection API",
         "status": "active",
-        "endpoints": [
-            "/dht-sensor",
-            "/navigation",
-            "/mapping",
-            "/general-sensor",
-            "/health"
-        ]
+        "version": "1.0.0"
     }
 
-# Health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now()}
+    return {
+        "status": "healthy", 
+        "timestamp": datetime.now(),
+        "database_connected": db_config.is_connected
+    }
 
-# DHT Sensor data endpoint
 @app.post("/dht-sensor")
 async def receive_dht_data(dht_data: DHTSensorData):
-    """
-    Endpoint to receive DHT sensor data (temperature and humidity)
-    """
-    # Set timestamp if not provided
+    """Receive DHT sensor data (temperature and humidity)"""
     if not dht_data.timestamp:
         dht_data.timestamp = datetime.now()
     
-    print("\n" + "="*60)
-    print("🌡️  DHT SENSOR DATA RECEIVED")
-    print("="*60)
-    print(f"Sensor ID: {dht_data.sensor_id}")
-    print(f"Temperature: {dht_data.temperature}°C")
-    print(f"Humidity: {dht_data.humidity}%")
-    print(f"Timestamp: {dht_data.timestamp}")
-    if dht_data.location:
-        print(f"Location: {dht_data.location}")
+    logger.info(f"DHT data received from sensor: {dht_data.sensor_id}")
     
-    # Save to MongoDB
-    try:
-        collection = db_config.get_collection(COLLECTIONS["dht_sensor"])
-        if collection is not None:
-            document = dht_data.dict()
-            result = await collection.insert_one(document)
-            print(f"💾 Data saved to MongoDB with ID: {result.inserted_id}")
-            print("="*60)
-            
-            return {
-                "status": "success",
-                "message": "DHT sensor data received and saved to database",
-                "data_received": dht_data.dict(),
-                "database_id": str(result.inserted_id)
-            }
-        else:
-            print("❌ Database connection not available")
-            print("="*60)
-            return {
-                "status": "partial_success",
-                "message": "DHT sensor data received but not saved (database unavailable)",
-                "data_received": dht_data.dict()
-            }
-    except Exception as e:
-        print(f"❌ Error saving to database: {e}")
-        print("="*60)
-        return {
-            "status": "error",
-            "message": f"DHT sensor data received but database error: {str(e)}",
-            "data_received": dht_data.dict()
-        }
+    # Save to database
+    save_result = await save_to_database(COLLECTIONS["dht_sensor"], dht_data.model_dump())
+    
+    return {
+        **save_result,
+        "data_type": "dht_sensor",
+        "sensor_id": dht_data.sensor_id,
+        "timestamp": dht_data.timestamp
+    }
 
-# Navigation data endpoint
 @app.post("/navigation")
 async def receive_navigation_data(nav_data: NavigationData):
-    """
-    Endpoint to receive navigation data (position, orientation, velocity)
-    """
-    # Set timestamp if not provided
+    """Receive navigation data (position, orientation, velocity)"""
     if not nav_data.timestamp:
         nav_data.timestamp = datetime.now()
     
-    print("\n" + "="*60)
-    print("🧭 NAVIGATION DATA RECEIVED")
-    print("="*60)
-    print(f"Device ID: {nav_data.device_id}")
-    print(f"Position: {nav_data.position}")
-    print(f"Orientation: {nav_data.orientation}")
-    if nav_data.velocity:
-        print(f"Velocity: {nav_data.velocity}")
-    print(f"Timestamp: {nav_data.timestamp}")
+    logger.info(f"Navigation data received from device: {nav_data.device_id}")
     
-    # Save to MongoDB
-    try:
-        collection = db_config.get_collection(COLLECTIONS["navigation"])
-        if collection is not None:
-            document = nav_data.dict()
-            result = await collection.insert_one(document)
-            print(f"💾 Data saved to MongoDB with ID: {result.inserted_id}")
-            print("="*60)
-            
-            return {
-                "status": "success",
-                "message": "Navigation data received and saved to database",
-                "data_received": nav_data.dict(),
-                "database_id": str(result.inserted_id)
-            }
-        else:
-            print("❌ Database connection not available")
-            print("="*60)
-            return {
-                "status": "partial_success",
-                "message": "Navigation data received but not saved (database unavailable)",
-                "data_received": nav_data.dict()
-            }
-    except Exception as e:
-        print(f"❌ Error saving to database: {e}")
-        print("="*60)
-        return {
-            "status": "error",
-            "message": f"Navigation data received but database error: {str(e)}",
-            "data_received": nav_data.dict()
-        }
+    # Save to database
+    save_result = await save_to_database(COLLECTIONS["navigation"], nav_data.model_dump())
+    
+    return {
+        **save_result,
+        "data_type": "navigation",
+        "device_id": nav_data.device_id,
+        "timestamp": nav_data.timestamp
+    }
 
-# Mapping data endpoint
 @app.post("/mapping")
 async def receive_mapping_data(mapping_data: MappingData):
-    """
-    Endpoint to receive mapping/sonar data
-    """
-    # Set timestamp if not provided
+    """Receive mapping/sonar data"""
     if not mapping_data.timestamp:
         mapping_data.timestamp = datetime.now()
     
-    print("\n" + "="*60)
-    print("🗺️  MAPPING DATA RECEIVED")
-    print("="*60)
-    print(f"Sensor ID: {mapping_data.sensor_id}")
-    print(f"Number of scan points: {len(mapping_data.scan_data)}")
-    print(f"Timestamp: {mapping_data.timestamp}")
-    if mapping_data.position:
-        print(f"Sensor Position: {mapping_data.position}")
-    print("Sample scan data (first 3 points):")
-    for i, point in enumerate(mapping_data.scan_data[:3]):
-        print(f"  Point {i+1}: {point}")
+    logger.info(f"Mapping data received from sensor: {mapping_data.sensor_id}, points: {len(mapping_data.scan_data)}")
     
-    # Save to MongoDB
-    try:
-        collection = db_config.get_collection(COLLECTIONS["mapping"])
-        if collection is not None:
-            document = mapping_data.dict()
-            result = await collection.insert_one(document)
-            print(f"💾 Data saved to MongoDB with ID: {result.inserted_id}")
-            print("="*60)
-            
-            return {
-                "status": "success",
-                "message": "Mapping data received and saved to database",
-                "data_received": {
-                    "sensor_id": mapping_data.sensor_id,
-                    "scan_points_count": len(mapping_data.scan_data),
-                    "timestamp": mapping_data.timestamp
-                },
-                "database_id": str(result.inserted_id)
-            }
-        else:
-            print("❌ Database connection not available")
-            print("="*60)
-            return {
-                "status": "partial_success",
-                "message": "Mapping data received but not saved (database unavailable)",
-                "data_received": {
-                    "sensor_id": mapping_data.sensor_id,
-                    "scan_points_count": len(mapping_data.scan_data),
-                    "timestamp": mapping_data.timestamp
-                }
-            }
-    except Exception as e:
-        print(f"❌ Error saving to database: {e}")
-        print("="*60)
-        return {
-            "status": "error",
-            "message": f"Mapping data received but database error: {str(e)}",
-            "data_received": {
-                "sensor_id": mapping_data.sensor_id,
-                "scan_points_count": len(mapping_data.scan_data),
-                "timestamp": mapping_data.timestamp
-            }
-        }
+    # Save to database
+    save_result = await save_to_database(COLLECTIONS["mapping"], mapping_data.model_dump())
+    
+    return {
+        **save_result,
+        "data_type": "mapping",
+        "sensor_id": mapping_data.sensor_id,
+        "scan_points": len(mapping_data.scan_data),
+        "timestamp": mapping_data.timestamp
+    }
 
-# General sensor data endpoint
 @app.post("/general-sensor")
 async def receive_general_sensor_data(sensor_data: GeneralSensorData):
-    """
-    Endpoint to receive any general sensor data
-    """
-    # Set timestamp if not provided
+    """Receive any general sensor data"""
     if not sensor_data.timestamp:
         sensor_data.timestamp = datetime.now()
     
-    print("\n" + "="*60)
-    print("📊 GENERAL SENSOR DATA RECEIVED")
-    print("="*60)
-    print(f"Sensor Type: {sensor_data.sensor_type}")
-    print(f"Sensor ID: {sensor_data.sensor_id}")
-    print(f"Data: {json.dumps(sensor_data.data, indent=2)}")
-    print(f"Timestamp: {sensor_data.timestamp}")
-    if sensor_data.metadata:
-        print(f"Metadata: {json.dumps(sensor_data.metadata, indent=2)}")
+    logger.info(f"General sensor data received: {sensor_data.sensor_type} from {sensor_data.sensor_id}")
     
-    # Save to MongoDB
-    try:
-        collection = db_config.get_collection(COLLECTIONS["general_sensor"])
-        if collection is not None:
-            document = sensor_data.dict()
-            result = await collection.insert_one(document)
-            print(f"💾 Data saved to MongoDB with ID: {result.inserted_id}")
-            print("="*60)
-            
-            return {
-                "status": "success",
-                "message": "General sensor data received and saved to database",
-                "data_received": sensor_data.dict(),
-                "database_id": str(result.inserted_id)
-            }
-        else:
-            print("❌ Database connection not available")
-            print("="*60)
-            return {
-                "status": "partial_success",
-                "message": "General sensor data received but not saved (database unavailable)",
-                "data_received": sensor_data.dict()
-            }
-    except Exception as e:
-        print(f"❌ Error saving to database: {e}")
-        print("="*60)
-        return {
-            "status": "error",
-            "message": f"General sensor data received but database error: {str(e)}",
-            "data_received": sensor_data.dict()
-        }
+    # Save to database
+    save_result = await save_to_database(COLLECTIONS["general_sensor"], sensor_data.model_dump())
+    
+    return {
+        **save_result,
+        "data_type": "general_sensor",
+        "sensor_type": sensor_data.sensor_type,
+        "sensor_id": sensor_data.sensor_id,
+        "timestamp": sensor_data.timestamp
+    }
 
-# Batch data endpoint for multiple sensors
 @app.post("/batch-data")
 async def receive_batch_data(batch_data: List[Dict[str, Any]]):
-    """
-    Endpoint to receive batch data from multiple sensors
-    """
+    """Receive batch data from multiple sensors"""
     current_time = datetime.now()
     
-    print("\n" + "="*60)
-    print("📦 BATCH DATA RECEIVED")
-    print("="*60)
-    print(f"Number of data points: {len(batch_data)}")
-    print(f"Timestamp: {current_time}")
+    logger.info(f"Batch data received with {len(batch_data)} points")
     
-    for i, data_point in enumerate(batch_data):
-        print(f"\nData Point {i+1}:")
-        print(json.dumps(data_point, indent=2))
+    # Save to database
+    batch_document = {
+        "batch_timestamp": current_time,
+        "batch_size": len(batch_data),
+        "data_points": batch_data
+    }
     
-    # Save to MongoDB
-    try:
-        collection = db_config.get_collection(COLLECTIONS["batch_data"])
-        if collection is not None:
-            # Add timestamp to batch document
-            batch_document = {
-                "batch_timestamp": current_time,
-                "batch_size": len(batch_data),
-                "data_points": batch_data
-            }
-            result = await collection.insert_one(batch_document)
-            print(f"💾 Batch data saved to MongoDB with ID: {result.inserted_id}")
-            print("="*60)
-            
-            return {
-                "status": "success",
-                "message": f"Batch data received and saved to database ({len(batch_data)} points)",
-                "data_points_count": len(batch_data),
-                "database_id": str(result.inserted_id)
-            }
-        else:
-            print("❌ Database connection not available")
-            print("="*60)
-            return {
-                "status": "partial_success",
-                "message": f"Batch data received but not saved (database unavailable) ({len(batch_data)} points)",
-                "data_points_count": len(batch_data)
-            }
-    except Exception as e:
-        print(f"❌ Error saving to database: {e}")
-        print("="*60)
-        return {
-            "status": "error",
-            "message": f"Batch data received but database error: {str(e)} ({len(batch_data)} points)",
-            "data_points_count": len(batch_data)
-        }
+    save_result = await save_to_database(COLLECTIONS["batch_data"], batch_document)
+    
+    return {
+        **save_result,
+        "data_type": "batch_data",
+        "batch_size": len(batch_data),
+        "timestamp": current_time
+    }
 
-# Database query endpoints
+# Data retrieval endpoints
 @app.get("/data/dht-sensor")
 async def get_dht_sensor_data(limit: int = 10, sensor_id: Optional[str] = None):
     """Get DHT sensor data from database"""
@@ -360,10 +203,7 @@ async def get_dht_sensor_data(limit: int = 10, sensor_id: Optional[str] = None):
         if collection is None:
             raise HTTPException(status_code=503, detail="Database not available")
         
-        query = {}
-        if sensor_id:
-            query["sensor_id"] = sensor_id
-            
+        query = {"sensor_id": sensor_id} if sensor_id else {}
         cursor = collection.find(query).sort("timestamp", -1).limit(limit)
         documents = await cursor.to_list(length=limit)
         
@@ -371,13 +211,9 @@ async def get_dht_sensor_data(limit: int = 10, sensor_id: Optional[str] = None):
         for doc in documents:
             doc["_id"] = str(doc["_id"])
             
-        return {
-            "status": "success",
-            "count": len(documents),
-            "data": documents
-        }
+        return {"status": "success", "count": len(documents), "data": documents}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 @app.get("/data/navigation")
 async def get_navigation_data(limit: int = 10, device_id: Optional[str] = None):
@@ -387,24 +223,16 @@ async def get_navigation_data(limit: int = 10, device_id: Optional[str] = None):
         if collection is None:
             raise HTTPException(status_code=503, detail="Database not available")
         
-        query = {}
-        if device_id:
-            query["device_id"] = device_id
-            
+        query = {"device_id": device_id} if device_id else {}
         cursor = collection.find(query).sort("timestamp", -1).limit(limit)
         documents = await cursor.to_list(length=limit)
         
-        # Convert ObjectId to string
         for doc in documents:
             doc["_id"] = str(doc["_id"])
             
-        return {
-            "status": "success",
-            "count": len(documents),
-            "data": documents
-        }
+        return {"status": "success", "count": len(documents), "data": documents}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 @app.get("/data/mapping")
 async def get_mapping_data(limit: int = 10, sensor_id: Optional[str] = None):
@@ -414,29 +242,24 @@ async def get_mapping_data(limit: int = 10, sensor_id: Optional[str] = None):
         if collection is None:
             raise HTTPException(status_code=503, detail="Database not available")
         
-        query = {}
-        if sensor_id:
-            query["sensor_id"] = sensor_id
-            
+        query = {"sensor_id": sensor_id} if sensor_id else {}
         cursor = collection.find(query).sort("timestamp", -1).limit(limit)
         documents = await cursor.to_list(length=limit)
         
-        # Convert ObjectId to string
         for doc in documents:
             doc["_id"] = str(doc["_id"])
             
-        return {
-            "status": "success",
-            "count": len(documents),
-            "data": documents
-        }
+        return {"status": "success", "count": len(documents), "data": documents}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 @app.get("/data/stats")
 async def get_database_stats():
     """Get database statistics"""
     try:
+        if not db_config.is_connected:
+            raise HTTPException(status_code=503, detail="Database not available")
+            
         stats = {}
         for collection_key, collection_name in COLLECTIONS.items():
             collection = db_config.get_collection(collection_name)
@@ -452,13 +275,11 @@ async def get_database_stats():
             "collections": stats
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 if __name__ == "__main__":
-    print("🚀 Starting Underwater Navigation Data Collection API Server...")
-    print("📡 Ready to receive sensor data from your underwater navigation system!")
-    print("🌐 Server will be available at: http://localhost:8000")
-    print("📚 API Documentation: http://localhost:8000/docs")
-    print("🔧 Interactive API: http://localhost:8000/redoc")
-    print("\nPress Ctrl+C to stop the server\n")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "0.0.0.0")
+    
+    logger.info(f"Starting server on {host}:{port}")
+    uvicorn.run("main:app", host=host, port=port, reload=False)
